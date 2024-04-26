@@ -10,9 +10,6 @@ on:
       working_directory:
         type: string
         default: "."
-    secrets:
-      GITHUB_TOKEN:
-        required: true
 
 jobs:
   build-publish:
