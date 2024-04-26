@@ -11,7 +11,7 @@ on:
         type: string
         default: "."
     secrets:
-      TOKEN:
+      PASSWORD:
         required: true
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.TOKEN }}
+          password: ${{ secrets.PASSWORD }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
