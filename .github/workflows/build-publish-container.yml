@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v1
+      - uses: jdx/mise-action@v2
       - name: "Build"
         run: |
           cd ${{ inputs.working_directory }}

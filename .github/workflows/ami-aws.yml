@@ -48,7 +48,7 @@ jobs:
         run: |
           echo "OPS_DIR=$HOME/.ops" >> $GITHUB_ENV
           echo "$HOME/.ops/bin" >> $GITHUB_PATH
-      - uses: oven-sh/setup-bun@v1
+      - uses: jdx/mise-action@v2
       - name: Create AMI
         run: |
           cd ${{ inputs.working_directory }}
