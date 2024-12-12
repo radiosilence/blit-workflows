@@ -23,12 +23,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - name: "Build"
-        run: |
-          cd ${{ inputs.working_directory }}
-          make build
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -64,7 +58,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: ./web
+          context: ${{ inputs.working_directory }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
