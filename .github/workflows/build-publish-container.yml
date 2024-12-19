@@ -7,6 +7,9 @@ permissions:
 on:
   workflow_call:
     inputs:
+      working-directory:
+        type: string
+        default: "."
       image:
         type: string
         default: ${{ github.event.repository.name }}
@@ -61,6 +64,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
+          context: ${{ inputs.working-directory }}
           platforms: ${{ inputs.platforms }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
