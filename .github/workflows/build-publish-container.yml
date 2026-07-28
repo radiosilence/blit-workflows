@@ -16,29 +16,55 @@ on:
       platforms:
         type: string
         default: "linux/amd64,linux/arm64"
+      version:
+        description: >-
+          Release version to tag, without a leading v. Publishes {version},
+          {major}.{minor}, {major} and latest alongside the usual tags. For repos
+          that cut releases from a version file rather than a git tag, where the
+          build runs on a branch push and metadata-action has no tag to read.
+        type: string
+        default: ""
     secrets:
       PASSWORD:
         required: true
 
 jobs:
-  build-publish:
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
-
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      json: ${{ steps.meta.outputs.json }}
+      labels: ${{ steps.meta.outputs.labels }}
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # One job per architecture on a runner of that architecture, rather than
+      # one job emulating the others: emulated compilation is an order of
+      # magnitude slower, and a native build exercises the code path the
+      # hardware actually runs.
+      - name: Map platforms onto runners
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          # amd64 and arm64 have hosted runners, so they build natively.
+          # Anything else (linux/arm/v7, riscv) has none and still needs QEMU —
+          # kept working rather than quietly dropped.
+          matrix=$(jq -cn --arg platforms "$PLATFORMS" '
+            $platforms | split(",") | map(
+              gsub("^\\s+|\\s+$"; "") | select(length > 0) | {
+                platform: .,
+                arch: (sub("^[^/]+/"; "") | gsub("/"; "-")),
+                runner: (if . == "linux/arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end),
+                qemu: (. != "linux/amd64" and . != "linux/arm64"),
+              })')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          jq . <<< "$matrix"
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
           flavor: |
@@ -53,19 +79,169 @@ jobs:
             type=ref,event=pr
             type=sha
 
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [prepare]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
+      # A pull request builds but publishes nothing, so a broken Dockerfile fails
+      # before merge rather than after.
+      PUBLISH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
       - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.PASSWORD }}
 
-      - name: Build and push
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+      - name: Build ${{ matrix.platform }}
+        if: env.PUBLISH != 'true'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: ${{ inputs.working-directory }}
-          platforms: ${{ inputs.platforms }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          labels: ${{ needs.prepare.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}-${{ matrix.arch }}
+
+      # Pushed by digest, with no tag of its own: a tag pointing at one
+      # architecture is what everybody pulls until the manifest lands, and a
+      # per-run staging tag would need deleting afterwards by a token that may
+      # not be allowed to. The merge job names every tag, once, from these
+      # digests.
+      - name: Build and push ${{ matrix.platform }}
+        id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: ${{ inputs.working-directory }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.prepare.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ inputs.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}-${{ matrix.arch }}
+
+      # The filename is the digest; the file itself is empty. It only has to
+      # survive the hop to the merge job.
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ inputs.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish manifest
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ inputs.image }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PASSWORD }}
+
+      - name: Create manifest
+        env:
+          META_JSON: ${{ needs.prepare.outputs.json }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          args=()
+          while read -r tag; do
+            [ -n "$tag" ] && args+=(--tag "$tag")
+          done <<< "$(jq -r '.tags[]' <<< "$META_JSON")"
+
+          # A version input asks for the semver set the tag-driven rules above
+          # cannot produce on a branch push. A prerelease gets its exact version
+          # and nothing else — moving `latest` or `2` onto an rc is how people
+          # end up running one by accident.
+          if [ -n "$VERSION" ]; then
+            args+=(--tag "$IMAGE:$VERSION")
+            case "$VERSION" in
+              *-*) echo "prerelease, so no latest/major/minor tags" ;;
+              *)
+                major=${VERSION%%.*}
+                minor=${VERSION#"$major".}
+                minor=${minor%%.*}
+                for tag in "$major.$minor" "$major" latest; do
+                  args+=(--tag "$IMAGE:$tag")
+                done
+                ;;
+            esac
+          fi
+
+          digests=(/tmp/digests/*)
+          if [ ${#digests[@]} -eq 0 ]; then
+            echo "no digests to merge — every build leg failed to publish one" >&2
+            exit 1
+          fi
+          for digest in "${digests[@]}"; do
+            args+=("$IMAGE@sha256:$(basename "$digest")")
+          done
+
+          printf 'docker buildx imagetools create'; printf ' %q' "${args[@]}"; echo
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Summarise
+        env:
+          META_JSON: ${{ needs.prepare.outputs.json }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            jq -r '.tags[]' <<< "$META_JSON"
+            [ -n "$VERSION" ] && echo "$IMAGE:$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
