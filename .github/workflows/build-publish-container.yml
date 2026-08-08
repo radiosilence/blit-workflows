@@ -24,6 +24,17 @@ on:
           build runs on a branch push and metadata-action has no tag to read.
         type: string
         default: ""
+      context-artifact:
+        description: >-
+          Name of an artifact to unpack into the build context, suffixed with
+          the leg's arch — `bin` fetches `bin-amd64` for the amd64 leg. For
+          callers that compile on the runner, where a language toolchain's own
+          cache subdivides by dependency and Docker's layer cache does not, so
+          a `RUN cargo build` recompiles everything on any lockfile movement.
+          The producing job lives in the caller and must be a `needs` of this
+          call. Artifacts carry no exec bit, so a binary needs `COPY --chmod`.
+        type: string
+        default: ""
     secrets:
       PASSWORD:
         required: true
@@ -97,6 +108,16 @@ jobs:
       PUBLISH: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # After the checkout, so what the caller compiled wins over anything of
+      # the same name in the tree. Missing artifacts fail here rather than
+      # producing an image built from whatever the repository happened to hold.
+      - name: Unpack context artifact
+        if: inputs.context-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ inputs.context-artifact }}-${{ matrix.arch }}
+          path: ${{ inputs.working-directory }}
 
       - name: Set up QEMU
         if: matrix.qemu
