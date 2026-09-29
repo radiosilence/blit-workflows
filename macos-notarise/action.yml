@@ -1,0 +1,93 @@
+name: macOS sign and notarise
+description: >
+  Signs Mach-O binaries in place with a Developer ID (hardened runtime, secure
+  timestamp) and notarises them, so Gatekeeper runs them from a browser
+  download without clearing quarantine. Fails if Apple does not accept them.
+
+inputs:
+  binaries:
+    description: Paths to the binaries to sign, one per line.
+    required: true
+  certificate-p12:
+    description: Base64 of the Developer ID Application certificate (.p12).
+    required: true
+  certificate-password:
+    description: Password of the .p12.
+    required: true
+  api-key-p8:
+    description: Base64 of the App Store Connect API key (.p8).
+    required: true
+  api-key-id:
+    description: App Store Connect API key ID.
+    required: true
+  api-issuer-id:
+    description: App Store Connect issuer ID.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BINARIES: ${{ inputs.binaries }}
+        CERTIFICATE_P12: ${{ inputs.certificate-p12 }}
+        CERTIFICATE_PASSWORD: ${{ inputs.certificate-password }}
+        API_KEY_P8: ${{ inputs.api-key-p8 }}
+        API_KEY_ID: ${{ inputs.api-key-id }}
+        API_ISSUER_ID: ${{ inputs.api-issuer-id }}
+      run: |
+        set -euo pipefail
+
+        for var in CERTIFICATE_P12 CERTIFICATE_PASSWORD API_KEY_P8 API_KEY_ID API_ISSUER_ID; do
+          if [ -z "${!var}" ]; then
+            echo "::error::macos-notarise: ${var} is empty; set the MACOS_CERTIFICATE_* and APPLE_API_* repository secrets"
+            exit 1
+          fi
+        done
+
+        work=$(mktemp -d "$RUNNER_TEMP/notarise.XXXXXX")
+        keychain="$work/signing.keychain-db"
+        trap 'security delete-keychain "$keychain" 2>/dev/null || true; rm -rf "$work"' EXIT
+
+        # A keychain for this step alone, with a random password, which
+        # codesign may use without a prompt. The identity name is read back
+        # from the certificate so it can be renewed without editing callers.
+        password=$(openssl rand -hex 24)
+        security create-keychain -p "$password" "$keychain"
+        security set-keychain-settings -lut 21600 "$keychain"
+        security unlock-keychain -p "$password" "$keychain"
+        printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$work/certificate.p12"
+        security import "$work/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+        security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+        identity=$(security find-identity -v -p codesigning "$keychain" \
+          | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+        if [ -z "$identity" ]; then
+          echo "::error::macos-notarise: no Developer ID Application identity in the certificate"
+          exit 1
+        fi
+
+        mkdir "$work/payload"
+        while IFS= read -r bin; do
+          [ -n "$bin" ] || continue
+          codesign --force --options runtime --timestamp --sign "$identity" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          cp "$bin" "$work/payload/"
+        done <<< "$BINARIES"
+
+        # notarytool takes a zip, dmg or pkg. The ticket is keyed on each
+        # binary's code directory hash, so it covers the originals too.
+        ditto -c -k --norsrc --noextattr "$work/payload" "$work/payload.zip"
+        printf '%s' "$API_KEY_P8" | base64 --decode > "$work/AuthKey.p8"
+        xcrun notarytool submit "$work/payload.zip" \
+          --key "$work/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+          --wait --timeout 30m --output-format json > "$work/result.json"
+        status=$(plutil -extract status raw "$work/result.json")
+        id=$(plutil -extract id raw "$work/result.json")
+        if [ "$status" != "Accepted" ]; then
+          echo "::error::macos-notarise: submission $id finished as $status"
+          xcrun notarytool log "$id" \
+            --key "$work/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" || true
+          exit 1
+        fi
+        echo "Notarised ($id)"
