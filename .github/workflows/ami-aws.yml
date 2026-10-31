@@ -46,19 +46,23 @@ jobs:
         run: curl https://ops.city/get.sh -sSfL | sh
       - name: Set OPS environment variables
         run: |
-          echo "OPS_DIR=$HOME/.ops" >> $GITHUB_ENV
-          echo "$HOME/.ops/bin" >> $GITHUB_PATH
+          echo "OPS_DIR=$HOME/.ops" >> "$GITHUB_ENV"
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
       - uses: jdx/mise-action@v2
       - name: Create AMI
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
-          cd ${{ inputs.working_directory }}
+          cd "$WORKING_DIRECTORY"
           make image-create-aws
       - name: Set AMI ID
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
-          cd ${{ inputs.working_directory }}
+          cd "$WORKING_DIRECTORY"
           make image-get-aws | jq
-          AMI_ID=$(echo $(make image-get-aws) | jq -r '.ID')
-          echo "TF_VAR_ami_id=\"$AMI_ID\"" >> $GITHUB_ENV
+          AMI_ID=$(make image-get-aws | jq -r '.ID')
+          echo "TF_VAR_ami_id=\"$AMI_ID\"" >> "$GITHUB_ENV"
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@4c569ffb1a0f1bf0daf00539abb505bcd246748a # v1.0.0
         id: apply-upload
